@@ -1,21 +1,26 @@
+import * as functions from 'firebase-functions/v1';
 import * as admin from 'firebase-admin';
 import Stripe from 'stripe';
 import * as nodemailer from 'nodemailer';
-import { defineJsonSecret } from 'firebase-functions/params';
-import { onCall, onRequest, HttpsError } from 'firebase-functions/v2/https';
-import { onDocumentUpdated } from 'firebase-functions/v2/firestore';
+import { defineSecret } from 'firebase-functions/params';
 
 // Define the secret that contains all config values
-const config = defineJsonSecret('FUNCTIONS_CONFIG_EXPORT');
+const configSecret = defineSecret('FUNCTIONS_CONFIG_EXPORT');
 
 // Initialize Firebase Admin
 admin.initializeApp();
+
+// Helper to get parsed config from secret
+function getConfig() {
+  return JSON.parse(configSecret.value());
+}
 
 // Initialize Stripe (will be initialized lazily when config is available)
 let stripe: Stripe;
 function getStripe() {
   if (!stripe) {
-    stripe = new Stripe(config.value().stripe.secret_key, {
+    const config = getConfig();
+    stripe = new Stripe(config.stripe.secret_key, {
       apiVersion: '2023-10-16'
     });
   }
@@ -26,11 +31,12 @@ function getStripe() {
 let transporter: nodemailer.Transporter;
 function getTransporter() {
   if (!transporter) {
+    const config = getConfig();
     transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: {
-        user: config.value().email.user,
-        pass: config.value().email.password
+        user: config.email.user,
+        pass: config.email.password
       }
     });
   }
@@ -48,11 +54,12 @@ interface CheckoutSessionParams {
 /**
  * Create a Stripe Checkout session
  */
-export const createCheckoutSession = onCall(
-  { secrets: [config] },
-  async (request) => {
+export const createCheckoutSession = functions
+  .runWith({ secrets: [configSecret] })
+  .https.onCall(async (data: CheckoutSessionParams, context) => {
     try {
-      const { itemId, amount, paymentType, customerEmail, itemDescription } = request.data as CheckoutSessionParams;
+      const { itemId, amount, paymentType, customerEmail, itemDescription } = data;
+      const config = getConfig();
 
       // Create Stripe Checkout session
       const session = await getStripe().checkout.sessions.create({
@@ -71,8 +78,8 @@ export const createCheckoutSession = onCall(
           }
         ],
         mode: 'payment',
-        success_url: `${config.value().app.url}/confirmation?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${config.value().app.url}/checkout/${itemId}?cancelled=true`,
+        success_url: `${config.app.url}/confirmation?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${config.app.url}/checkout/${itemId}?cancelled=true`,
         customer_email: customerEmail,
         metadata: {
           itemId,
@@ -97,22 +104,22 @@ export const createCheckoutSession = onCall(
       };
     } catch (error) {
       console.error('Error creating checkout session:', error);
-      throw new HttpsError(
+      throw new functions.https.HttpsError(
         'internal',
         'Failed to create checkout session'
       );
     }
-  }
-);
+  });
 
 /**
  * Handle Stripe webhook events
  */
-export const stripeWebhook = onRequest(
-  { secrets: [config] },
-  async (req, res) => {
+export const stripeWebhook = functions
+  .runWith({ secrets: [configSecret] })
+  .https.onRequest(async (req, res) => {
     const sig = req.headers['stripe-signature'] as string;
-    const webhookSecret = config.value().stripe.webhook_secret;
+    const config = getConfig();
+    const webhookSecret = config.stripe.webhook_secret;
 
     let event: Stripe.Event;
 
@@ -150,8 +157,7 @@ export const stripeWebhook = onRequest(
     }
 
     res.json({ received: true });
-  }
-);
+  });
 
 /**
  * Handle successful payment
@@ -239,8 +245,9 @@ async function sendConfirmationEmail(
   itemType: string,
   paymentType: string
 ) {
+  const config = getConfig();
   const mailOptions = {
-    from: config.value().email.user,
+    from: config.email.user,
     to: email,
     subject: 'Payment Confirmed - FindMyTreasure Recovery Service',
     html: `
@@ -272,9 +279,10 @@ async function sendConfirmationEmail(
  * Send notification email to admin
  */
 async function sendAdminNotificationEmail(itemId: string, itemData: any) {
+  const config = getConfig();
   const mailOptions = {
-    from: config.value().email.user,
-    to: config.value().email.admin,
+    from: config.email.user,
+    to: config.email.admin,
     subject: `New Recovery Job - ${itemData.itemType}`,
     html: `
       <h2>New Recovery Job Received</h2>
@@ -285,7 +293,7 @@ async function sendAdminNotificationEmail(itemId: string, itemData: any) {
       <p><strong>Location:</strong> ${itemData.location.address}</p>
       <p><strong>Date Lost:</strong> ${itemData.dateLost}</p>
       <p><strong>Payment Status:</strong> ${itemData.paymentStatus}</p>
-      <p><a href="${config.value().app.url}/admin/jobs/${itemId}">View Job Details</a></p>
+      <p><a href="${config.app.url}/admin/jobs/${itemId}">View Job Details</a></p>
     `
   };
 
@@ -300,21 +308,18 @@ async function sendAdminNotificationEmail(itemId: string, itemData: any) {
 /**
  * Send status update email to customer
  */
-export const sendStatusUpdateEmail = onDocumentUpdated(
-  {
-    document: 'lostItems/{itemId}',
-    secrets: [config]
-  },
-  async (event) => {
-    const before = event.data?.before.data();
-    const after = event.data?.after.data();
-
-    if (!before || !after) return;
+export const sendStatusUpdateEmail = functions
+  .runWith({ secrets: [configSecret] })
+  .firestore.document('lostItems/{itemId}')
+  .onUpdate(async (change, context) => {
+    const before = change.before.data();
+    const after = change.after.data();
 
     // Check if status changed
     if (before.status !== after.status) {
+      const config = getConfig();
       const mailOptions = {
-        from: config.value().email.user,
+        from: config.email.user,
         to: after.userEmail,
         subject: `Update on Your Recovery - ${after.itemType}`,
         html: `
@@ -336,5 +341,4 @@ export const sendStatusUpdateEmail = onDocumentUpdated(
         console.error('Error sending status update email:', error);
       }
     }
-  }
-);
+  });
