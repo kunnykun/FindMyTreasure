@@ -1,24 +1,41 @@
-import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import Stripe from 'stripe';
 import * as nodemailer from 'nodemailer';
+import { defineJsonSecret } from 'firebase-functions/params';
+import { onCall, onRequest, HttpsError } from 'firebase-functions/v2/https';
+import { onDocumentUpdated } from 'firebase-functions/v2/firestore';
+
+// Define the secret that contains all config values
+const config = defineJsonSecret('FUNCTIONS_CONFIG_EXPORT');
 
 // Initialize Firebase Admin
 admin.initializeApp();
 
-// Initialize Stripe
-const stripe = new Stripe(functions.config().stripe.secret_key, {
-  apiVersion: '2023-10-16'
-});
-
-// Email transporter (configure with your email service)
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: functions.config().email.user,
-    pass: functions.config().email.password
+// Initialize Stripe (will be initialized lazily when config is available)
+let stripe: Stripe;
+function getStripe() {
+  if (!stripe) {
+    stripe = new Stripe(config.value().stripe.secret_key, {
+      apiVersion: '2023-10-16'
+    });
   }
-});
+  return stripe;
+}
+
+// Email transporter (will be initialized lazily when config is available)
+let transporter: nodemailer.Transporter;
+function getTransporter() {
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: config.value().email.user,
+        pass: config.value().email.password
+      }
+    });
+  }
+  return transporter;
+}
 
 interface CheckoutSessionParams {
   itemId: string;
@@ -31,13 +48,14 @@ interface CheckoutSessionParams {
 /**
  * Create a Stripe Checkout session
  */
-export const createCheckoutSession = functions.https.onCall(
-  async (data: CheckoutSessionParams, context) => {
+export const createCheckoutSession = onCall(
+  { secrets: [config] },
+  async (request) => {
     try {
-      const { itemId, amount, paymentType, customerEmail, itemDescription } = data;
+      const { itemId, amount, paymentType, customerEmail, itemDescription } = request.data as CheckoutSessionParams;
 
       // Create Stripe Checkout session
-      const session = await stripe.checkout.sessions.create({
+      const session = await getStripe().checkout.sessions.create({
         payment_method_types: ['card'],
         line_items: [
           {
@@ -53,8 +71,8 @@ export const createCheckoutSession = functions.https.onCall(
           }
         ],
         mode: 'payment',
-        success_url: `${functions.config().app.url}/confirmation?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${functions.config().app.url}/checkout/${itemId}?cancelled=true`,
+        success_url: `${config.value().app.url}/confirmation?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${config.value().app.url}/checkout/${itemId}?cancelled=true`,
         customer_email: customerEmail,
         metadata: {
           itemId,
@@ -79,7 +97,7 @@ export const createCheckoutSession = functions.https.onCall(
       };
     } catch (error) {
       console.error('Error creating checkout session:', error);
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'internal',
         'Failed to create checkout session'
       );
@@ -90,47 +108,50 @@ export const createCheckoutSession = functions.https.onCall(
 /**
  * Handle Stripe webhook events
  */
-export const stripeWebhook = functions.https.onRequest(async (req, res) => {
-  const sig = req.headers['stripe-signature'] as string;
-  const webhookSecret = functions.config().stripe.webhook_secret;
+export const stripeWebhook = onRequest(
+  { secrets: [config] },
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'] as string;
+    const webhookSecret = config.value().stripe.webhook_secret;
 
-  let event: Stripe.Event;
+    let event: Stripe.Event;
 
-  try {
-    event = stripe.webhooks.constructEvent(req.rawBody, sig, webhookSecret);
-  } catch (err: any) {
-    console.error('Webhook signature verification failed:', err.message);
-    res.status(400).send(`Webhook Error: ${err.message}`);
-    return;
+    try {
+      event = getStripe().webhooks.constructEvent(req.rawBody, sig, webhookSecret);
+    } catch (err: any) {
+      console.error('Webhook signature verification failed:', err.message);
+      res.status(400).send(`Webhook Error: ${err.message}`);
+      return;
+    }
+
+    // Handle the event
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object as Stripe.Checkout.Session;
+        await handleSuccessfulPayment(session);
+        break;
+      }
+
+      case 'payment_intent.succeeded': {
+        const paymentIntent = event.data.object as Stripe.PaymentIntent;
+        console.log('PaymentIntent succeeded:', paymentIntent.id);
+        break;
+      }
+
+      case 'payment_intent.payment_failed': {
+        const paymentIntent = event.data.object as Stripe.PaymentIntent;
+        console.log('PaymentIntent failed:', paymentIntent.id);
+        await handleFailedPayment(paymentIntent);
+        break;
+      }
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    res.json({ received: true });
   }
-
-  // Handle the event
-  switch (event.type) {
-    case 'checkout.session.completed': {
-      const session = event.data.object as Stripe.Checkout.Session;
-      await handleSuccessfulPayment(session);
-      break;
-    }
-
-    case 'payment_intent.succeeded': {
-      const paymentIntent = event.data.object as Stripe.PaymentIntent;
-      console.log('PaymentIntent succeeded:', paymentIntent.id);
-      break;
-    }
-
-    case 'payment_intent.payment_failed': {
-      const paymentIntent = event.data.object as Stripe.PaymentIntent;
-      console.log('PaymentIntent failed:', paymentIntent.id);
-      await handleFailedPayment(paymentIntent);
-      break;
-    }
-
-    default:
-      console.log(`Unhandled event type: ${event.type}`);
-  }
-
-  res.json({ received: true });
-});
+);
 
 /**
  * Handle successful payment
@@ -219,7 +240,7 @@ async function sendConfirmationEmail(
   paymentType: string
 ) {
   const mailOptions = {
-    from: functions.config().email.user,
+    from: config.value().email.user,
     to: email,
     subject: 'Payment Confirmed - FindMyTreasure Recovery Service',
     html: `
@@ -240,7 +261,7 @@ async function sendConfirmationEmail(
   };
 
   try {
-    await transporter.sendMail(mailOptions);
+    await getTransporter().sendMail(mailOptions);
     console.log('Confirmation email sent to:', email);
   } catch (error) {
     console.error('Error sending confirmation email:', error);
@@ -252,8 +273,8 @@ async function sendConfirmationEmail(
  */
 async function sendAdminNotificationEmail(itemId: string, itemData: any) {
   const mailOptions = {
-    from: functions.config().email.user,
-    to: functions.config().email.admin,
+    from: config.value().email.user,
+    to: config.value().email.admin,
     subject: `New Recovery Job - ${itemData.itemType}`,
     html: `
       <h2>New Recovery Job Received</h2>
@@ -264,12 +285,12 @@ async function sendAdminNotificationEmail(itemId: string, itemData: any) {
       <p><strong>Location:</strong> ${itemData.location.address}</p>
       <p><strong>Date Lost:</strong> ${itemData.dateLost}</p>
       <p><strong>Payment Status:</strong> ${itemData.paymentStatus}</p>
-      <p><a href="${functions.config().app.url}/admin/jobs/${itemId}">View Job Details</a></p>
+      <p><a href="${config.value().app.url}/admin/jobs/${itemId}">View Job Details</a></p>
     `
   };
 
   try {
-    await transporter.sendMail(mailOptions);
+    await getTransporter().sendMail(mailOptions);
     console.log('Admin notification email sent');
   } catch (error) {
     console.error('Error sending admin notification email:', error);
@@ -279,16 +300,21 @@ async function sendAdminNotificationEmail(itemId: string, itemData: any) {
 /**
  * Send status update email to customer
  */
-export const sendStatusUpdateEmail = functions.firestore
-  .document('lostItems/{itemId}')
-  .onUpdate(async (change, context) => {
-    const before = change.before.data();
-    const after = change.after.data();
+export const sendStatusUpdateEmail = onDocumentUpdated(
+  {
+    document: 'lostItems/{itemId}',
+    secrets: [config]
+  },
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+
+    if (!before || !after) return;
 
     // Check if status changed
     if (before.status !== after.status) {
       const mailOptions = {
-        from: functions.config().email.user,
+        from: config.value().email.user,
         to: after.userEmail,
         subject: `Update on Your Recovery - ${after.itemType}`,
         html: `
@@ -304,10 +330,11 @@ export const sendStatusUpdateEmail = functions.firestore
       };
 
       try {
-        await transporter.sendMail(mailOptions);
+        await getTransporter().sendMail(mailOptions);
         console.log('Status update email sent to:', after.userEmail);
       } catch (error) {
         console.error('Error sending status update email:', error);
       }
     }
-  });
+  }
+);
