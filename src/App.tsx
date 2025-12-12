@@ -1,6 +1,7 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import Navigation from './components/Navigation';
 import Home from './pages/Home';
 import ReportLostItem from './pages/ReportLostItem';
 import Checkout from './pages/Checkout';
@@ -57,34 +58,37 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) =
 
 const AppRoutes: React.FC = () => {
   return (
-    <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/report-lost-item" element={<ReportLostItem />} />
-      <Route path="/checkout/:itemId" element={<Checkout />} />
-      <Route path="/login" element={<Login />} />
-      <Route path="/setup" element={<AdminSetup />} />
+    <>
+      <Navigation />
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/report-lost-item" element={<ReportLostItem />} />
+        <Route path="/checkout/:itemId" element={<Checkout />} />
+        <Route path="/login" element={<Login />} />
+        <Route path="/setup" element={<AdminSetup />} />
 
-      {/* Admin Routes */}
-      <Route
-        path="/admin"
-        element={
-          <ProtectedRoute>
-            <AdminDashboard />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/admin/jobs/:jobId"
-        element={
-          <ProtectedRoute>
-            <JobDetails />
-          </ProtectedRoute>
-        }
-      />
+        {/* Admin Routes */}
+        <Route
+          path="/admin"
+          element={
+            <ProtectedRoute>
+              <AdminDashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin/jobs/:jobId"
+          element={
+            <ProtectedRoute>
+              <JobDetails />
+            </ProtectedRoute>
+          }
+        />
 
-      {/* Catch all */}
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+        {/* Catch all */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </>
   );
 };
 
